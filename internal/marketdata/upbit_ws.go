@@ -1,7 +1,6 @@
 package marketdata
 
 import (
-	"bytes"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -32,6 +31,9 @@ func (c *WSClient) runOnce(onUpdate func()) error {
 	dialer := websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: 10 * time.Second,
+		// 읽기/쓰기 버퍼 명시 (gorilla 기본값 4096 → 16K로 확대해 fragmentation 감소)
+		ReadBufferSize:  16384,
+		WriteBufferSize: 4096,
 	}
 
 	conn, _, err := dialer.Dial(c.URL, http.Header{})
@@ -60,7 +62,8 @@ func (c *WSClient) runOnce(onUpdate func()) error {
 	pingTicker := time.NewTicker(c.PingInterval)
 	defer pingTicker.Stop()
 
-	msgCh := make(chan []byte, 512)
+	// 버퍼: WS goroutine이 parse goroutine より先行できるように余裕を持たせる
+	msgCh := make(chan []byte, 64)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -74,11 +77,12 @@ func (c *WSClient) runOnce(onUpdate func()) error {
 			if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
 				continue
 			}
-			msg = bytes.TrimSpace(msg)
+			// bytes.TrimSpace 제거: Upbit WS 메시지는 padding 없음
 			msgCh <- msg
 		}
 	}()
 
+	topN := c.TopN
 	for {
 		select {
 		case <-pingTicker.C:
@@ -100,8 +104,8 @@ func (c *WSClient) runOnce(onUpdate func()) error {
 			}
 
 			units := ob.OrderbookUnits
-			if c.TopN > 0 && len(units) > c.TopN {
-				units = units[:c.TopN]
+			if topN > 0 && len(units) > topN {
+				units = units[:topN]
 			}
 			c.Cache.Set(ob.Code, ob.Timestamp, units)
 

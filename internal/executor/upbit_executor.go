@@ -95,13 +95,21 @@ func (e *UpbitExecutor) OnSignal(sig *strategy.Signal) error {
 	// private WS lazy init
 	e.ensurePrivateWS()
 
-	// Refresh balances (REST)
-	accts, err := e.REST.GetAccounts()
-	if err != nil {
-		return err
-	}
-	e.Balances.UpdateFromAccounts(accts)
+	// 잔고 갱신: Private WS가 추적 중이면 캐시 사용 (REST 생략으로 ~150ms 절약)
+	// 단, 잔고가 0이거나 WS 미사용이면 REST로 재확인
+	e.mu.Lock()
+	wsReady := e.pwsReady
+	e.mu.Unlock()
+
 	krwBefore := e.Balances.Get("KRW")
+	if !wsReady || krwBefore <= 0 {
+		accts, err := e.REST.GetAccounts()
+		if err != nil {
+			return err
+		}
+		e.Balances.UpdateFromAccounts(accts)
+		krwBefore = e.Balances.Get("KRW")
+	}
 
 	// Apply reserve + max per trade
 	usable := krwBefore - e.SafetyKRWReserve
@@ -118,28 +126,27 @@ func (e *UpbitExecutor) OnSignal(sig *strategy.Signal) error {
 
 	var orders []*exchange.OrderResp
 	var summaries []storage.OrderSummary
+	var tradeErr error
 
 	snapCodes := []string{"KRW-" + asset, "USDT-" + asset, "KRW-USDT"}
 	snap := e.Cache.Snapshot(snapCodes)
 
 	switch op.BestDirection {
 	case strategy.DirA:
-		orders, err = e.execDirA(sig, usable, snap)
+		orders, tradeErr = e.execDirA(sig, usable, snap)
 	case strategy.DirB:
-		orders, err = e.execDirB(sig, usable, snap)
+		orders, tradeErr = e.execDirB(sig, usable, snap)
 	default:
 		return fmt.Errorf("unknown direction")
 	}
-	if err != nil {
-		log.Printf("[trade] 실행 실패: %v", err)
+	if tradeErr != nil {
+		log.Printf("[trade] 실행 실패: %v", tradeErr)
 	}
 
-	// After balances (최종 실현 손익은 REST 1회로 안전하게 확인)
-	accts2, err2 := e.REST.GetAccounts()
-	if err2 != nil {
-		return err2
+	// After balances: 거래 완료 후 최종 KRW 확인 (REST로 정확한 값)
+	if accts2, err2 := e.REST.GetAccounts(); err2 == nil {
+		e.Balances.UpdateFromAccounts(accts2)
 	}
-	e.Balances.UpdateFromAccounts(accts2)
 	krwAfter := e.Balances.Get("KRW")
 	realized := krwAfter - krwBefore
 
@@ -178,7 +185,7 @@ func (e *UpbitExecutor) OnSignal(sig *strategy.Signal) error {
 		_ = e.TradeWriter.Write(rec)
 	}
 
-	return err
+	return tradeErr
 }
 
 func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[string]struct {

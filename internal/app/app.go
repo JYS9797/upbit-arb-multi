@@ -34,7 +34,6 @@ type App struct {
 	TradeWriter *storage.JSONLWriter
 
 	lastPrint int64
-	lastEval  int64
 }
 
 func New(cfg *config.Config) *App {
@@ -134,54 +133,76 @@ func New(cfg *config.Config) *App {
 
 func (a *App) Run() {
 	minPrint := time.Duration(a.Cfg.Signal.MinPrintIntervalMs) * time.Millisecond
-	// 메시지마다 평가하지 않고 최소 간격마다만 수행
-	evalEvery := 100 * time.Millisecond
 
-	go a.WS.Run(nil)
+	// updateCh: WS 메시지가 올 때마다 신호. 버퍼 1로 중복 알림 collapse.
+	updateCh := make(chan struct{}, 1)
 
-	for {
-		now := time.Now().UnixMilli()
-		lastEval := atomic.LoadInt64(&a.lastEval)
-		if now-lastEval < evalEvery.Milliseconds() {
-			time.Sleep(10 * time.Millisecond)
-			continue
+	// execCh: 실행 goroutine에 신호 전달. 버퍼 1 = 실행 중 도착한 1개까지만 큐.
+	execCh := make(chan *strategy.Signal, 1)
+
+	// 실행 goroutine: 평가 루프와 완전히 분리 → 거래 중에도 평가 계속 진행
+	go func() {
+		for sig := range execCh {
+			_ = a.Exec.OnSignal(sig)
 		}
-		atomic.StoreInt64(&a.lastEval, now)
+	}()
 
-		// 각 자산별 기회 평가 → 가장 좋은 것 1개만 출력/저장
-		bestSig := (*strategy.Signal)(nil)
-		for _, asset := range a.Assets {
-			sig, ok := a.Detector.EvaluateAsset(a.Cache, asset)
-			if !ok {
-				continue
-			}
-			a.Notify.Print(sig)
-			if bestSig == nil || sig.Opportunity.BestProfitKRW > bestSig.Opportunity.BestProfitKRW {
-				bestSig = sig
-			}
+	// WS: 메시지가 올 때마다 updateCh에 신호 (이벤트 드리븐, 폴링 제거)
+	go a.WS.Run(func() {
+		select {
+		case updateCh <- struct{}{}:
+		default: // 이미 신호 있으면 스킵 (자동 debounce)
 		}
+	})
 
+	for range updateCh {
+		bestSig := a.evalBest()
 		if bestSig == nil {
 			continue
 		}
 
-		lastPrint := atomic.LoadInt64(&a.lastPrint)
-		if now-lastPrint < minPrint.Milliseconds() {
+		now := time.Now().UnixMilli()
+		if now-atomic.LoadInt64(&a.lastPrint) < minPrint.Milliseconds() {
+			// 출력/저장/실행 throttle 중 — 평가만 계속
 			continue
 		}
 		atomic.StoreInt64(&a.lastPrint, now)
 
+		// bestSig만 출력 (per-asset 출력 제거)
 		a.Notify.Print(bestSig)
 
+		// JSONL 저장은 별도 goroutine (디스크 I/O로 평가 루프 블로킹 방지)
 		if a.Saver != nil {
 			rec := a.buildSnapshot(bestSig)
-			if err := a.Saver.Write(rec); err != nil {
-				log.Printf("스냅샷 저장 실패: %v", err)
-			}
+			go func(r *storage.SnapshotRecord) {
+				if err := a.Saver.Write(r); err != nil {
+					log.Printf("스냅샷 저장 실패: %v", err)
+				}
+			}(rec)
 		}
 
-		_ = a.Exec.OnSignal(bestSig)
+		// 실행 채널 non-blocking 전송 (이미 거래 중이면 drop)
+		select {
+		case execCh <- bestSig:
+		default:
+		}
 	}
+}
+
+// evalBest: 모든 자산 순차 평가 후 최고 수익 신호 반환.
+// 평가 자체가 μs 단위로 빠르므로 goroutine 생성 오버헤드 없이 sequential이 유리.
+func (a *App) evalBest() *strategy.Signal {
+	var best *strategy.Signal
+	for _, asset := range a.Assets {
+		sig, ok := a.Detector.EvaluateAsset(a.Cache, asset)
+		if !ok {
+			continue
+		}
+		if best == nil || sig.Opportunity.BestProfitKRW > best.Opportunity.BestProfitKRW {
+			best = sig
+		}
+	}
+	return best
 }
 
 func (a *App) buildSnapshot(sig *strategy.Signal) *storage.SnapshotRecord {
