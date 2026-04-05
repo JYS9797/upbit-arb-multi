@@ -1,0 +1,70 @@
+upbit:
+  ws_url: "wss://api.upbit.com/websocket/v1"
+  private_ws_url: "wss://api.upbit.com/websocket/v1/private"
+  rest_base_url: "https://api.upbit.com"
+
+  # ✅ 키는 파일에 직접 넣지 말고 환경변수로 두는 걸 권장
+  # PowerShell 예:
+  #   $env:UPBIT_ACCESS_KEY="..."
+  #   $env:UPBIT_SECRET_KEY="..."
+  access_key: "${UPBIT_ACCESS_KEY}"
+  secret_key: "${UPBIT_SECRET_KEY}"
+
+  ping_interval_sec: 25
+  reconnect_backoff_ms: 2000
+
+markets:
+  # mode: static | top_krw
+  mode: "top_krw"
+
+  # static 모드일 때 사용
+  static_assets: ["XRP"]
+
+  # top_krw 모드일 때 사용 (KRW 마켓 24h 거래대금 상위 N개)
+  top_krw_n: 20
+
+  # 구독할 마켓 종류 (오더북 모니터링용)
+  include_krw: true
+  include_usdt: true
+  include_btc: true
+
+  # 오더북 상위 N호가만 사용 (속도/메모리 절약)
+  top_n_levels: 15
+
+trade_model:
+  # “최적 수량 탐색” 상한(자산 수량)
+  max_qty_asset: 200.0
+
+  fee_krw: 0.0005
+  fee_usdt: 0.0025
+
+signal:
+  # 기회 포착 기준(시뮬레이션). 실거래는 trading.enabled로 별도 제어
+  min_profit_krw: 3000
+  min_print_interval_ms: 400
+
+private_stream:
+  enabled: true
+  # 비우면 전체 마켓 주문 이벤트를 받음 (필요하면 ["KRW-XRP","USDT-XRP","KRW-USDT"]처럼 제한)
+  myorder_codes: []
+
+trading:
+  # ⚠️ 기본은 false. true로 바꾸면 실제 주문이 나갑니다.
+  enabled: true
+
+  # best 주문에 사용할 TIF: ioc 또는 fok
+  time_in_force: "ioc"
+
+  # 1회 트레이드에서 KRW로 사용할 최대 한도 (예: 200000 = 20만원)
+  max_krw_per_trade: 100000
+
+  # 계좌 KRW 잔고에서 안전하게 남겨둘 금액(원)
+  safety_krw_reserve: 0000
+
+storage:
+  enabled: true
+  out_dir: "data"
+  jsonl_filename: "snapshots.jsonl"
+
+runtime:
+  log_level: "info"
