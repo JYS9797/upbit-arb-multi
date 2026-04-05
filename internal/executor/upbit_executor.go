@@ -36,6 +36,9 @@ type UpbitExecutor struct {
 	ReconnectBackoff time.Duration
 	MyOrderCodes     []string
 
+	// tradeMu: 한 번에 하나의 거래만 실행 (TryLock으로 이미 진행 중이면 스킵)
+	tradeMu sync.Mutex
+	// mu: orderCh / orderLast / availSig 등 공유 맵 보호 (짧게만 보유)
 	mu sync.Mutex
 
 	// ---- private WS runtime state ----
@@ -81,11 +84,16 @@ func (e *UpbitExecutor) OnSignal(sig *strategy.Signal) error {
 	if !e.Enabled {
 		return nil
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
+
+	// 이미 거래 중이면 스킵 (큐잉 없음)
+	if !e.tradeMu.TryLock() {
+		log.Printf("[trade] 이전 거래 진행 중, 스킵")
+		return nil
+	}
+	defer e.tradeMu.Unlock()
 
 	// private WS lazy init
-	e.ensurePrivateWSLocked()
+	e.ensurePrivateWS()
 
 	// Refresh balances (REST)
 	accts, err := e.REST.GetAccounts()
@@ -196,6 +204,7 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 		need = maxKRW
 	}
 
+	// ── Leg 1: KRW → ASSET ──
 	krwTotal := fmt.Sprintf("%.0f", need)
 	buyReq := exchange.BestBuy(krwAsset, krwTotal, e.TimeInForce)
 	buy, err := e.REST.CreateOrder(buyReq)
@@ -211,7 +220,19 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 		return []*exchange.OrderResp{buyFinal}, fmt.Errorf("buy executed_volume=0")
 	}
 
-	sellReq := exchange.BestSell(usdtAsset, trimFloat(volAsset, 8), e.TimeInForce)
+	// Leg 1 완료 후 ASSET 잔고 정산 대기
+	assetAvail, _, waitErr := e.waitAvailPositive(asset, 2*time.Second)
+	if waitErr != nil {
+		log.Printf("[trade] DirA: asset avail wait: %v (fallback to executed_volume)", waitErr)
+		assetAvail = volAsset
+	}
+	volToSell := volAsset
+	if assetAvail > 0 && assetAvail < volToSell {
+		volToSell = assetAvail
+	}
+
+	// ── Leg 2: ASSET → USDT ──
+	sellReq := exchange.BestSell(usdtAsset, trimFloat(volToSell, 8), e.TimeInForce)
 	sell, err := e.REST.CreateOrder(sellReq)
 	if err != nil {
 		return []*exchange.OrderResp{buyFinal, sell}, err
@@ -225,7 +246,19 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 		return []*exchange.OrderResp{buyFinal, sellFinal}, fmt.Errorf("sell executed_funds=0")
 	}
 
-	convReq := exchange.BestSell(krwUsdt, trimFloat(usdtFunds, 8), e.TimeInForce)
+	// Leg 2 완료 후 USDT 잔고 정산 대기
+	usdtAvail, _, waitErr2 := e.waitAvailPositive("USDT", 2*time.Second)
+	if waitErr2 != nil {
+		log.Printf("[trade] DirA: USDT avail wait: %v (fallback to executed_funds)", waitErr2)
+		usdtAvail = usdtFunds
+	}
+	usdtToConv := usdtFunds
+	if usdtAvail > 0 && usdtAvail < usdtToConv {
+		usdtToConv = usdtAvail
+	}
+
+	// ── Leg 3: USDT → KRW ──
+	convReq := exchange.BestSell(krwUsdt, trimFloat(usdtToConv, 8), e.TimeInForce)
 	conv, err := e.REST.CreateOrder(convReq)
 	if err != nil {
 		return []*exchange.OrderResp{buyFinal, sellFinal, conv}, err
@@ -248,7 +281,7 @@ func (e *UpbitExecutor) execDirB(
 	usdtAsset := "USDT-" + asset
 	krwUsdt := "KRW-USDT"
 
-	// Step1: KRW -> USDT
+	// ── Leg 1: KRW → USDT ──
 	krwTotal := fmt.Sprintf("%.0f", maxKRW)
 	buyUsdtReq := exchange.BestBuy(krwUsdt, krwTotal, e.TimeInForce)
 	buyUsdt, err := e.REST.CreateOrder(buyUsdtReq)
@@ -266,12 +299,10 @@ func (e *UpbitExecutor) execDirB(
 		return []*exchange.OrderResp{buyUsdtFinal}, fmt.Errorf("buy usdt executed_volume=0")
 	}
 
-	// ✅ private WS 기반으로 USDT available 대기
-	var usdtAvail, usdtLocked float64
-	usdtAvail, usdtLocked, err = e.waitAvailPositive("USDT", 1500*time.Millisecond)
-	if err != nil {
-		// fallback 성격이라 로그만 남기고 진행
-		log.Printf("[trade] waitAvailPositive fallback: %v", err)
+	// Leg 1 완료 후 USDT 잔고 정산 대기
+	usdtAvail, usdtLocked, waitErr := e.waitAvailPositive("USDT", 1500*time.Millisecond)
+	if waitErr != nil {
+		log.Printf("[trade] DirB: waitAvailPositive USDT: %v", waitErr)
 	}
 
 	safety := 0.003 // 0.3%
@@ -286,7 +317,7 @@ func (e *UpbitExecutor) execDirB(
 			fmt.Errorf("no USDT available after step1 (avail=%.8f locked=%.8f got=%.8f)", usdtAvail, usdtLocked, usdtGot)
 	}
 
-	// Step2: USDT -> ASSET
+	// ── Leg 2: USDT → ASSET ──
 	usdtTotal := trimFloat(usdtToSpend, 6)
 	buyAssetReq := exchange.BestBuy(usdtAsset, usdtTotal, e.TimeInForce)
 	buyAsset, err := e.REST.CreateOrder(buyAssetReq)
@@ -304,8 +335,19 @@ func (e *UpbitExecutor) execDirB(
 		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal}, fmt.Errorf("buy asset executed_volume=0")
 	}
 
-	// Step3: ASSET -> KRW
-	sellReq := exchange.BestSell(krwAsset, trimFloat(assetVol, 8), e.TimeInForce)
+	// Leg 2 완료 후 ASSET 잔고 정산 대기
+	assetAvail, _, waitErr2 := e.waitAvailPositive(asset, 2*time.Second)
+	if waitErr2 != nil {
+		log.Printf("[trade] DirB: asset avail wait: %v (fallback to executed_volume)", waitErr2)
+		assetAvail = assetVol
+	}
+	volToSell := assetVol
+	if assetAvail > 0 && assetAvail < volToSell {
+		volToSell = assetAvail
+	}
+
+	// ── Leg 3: ASSET → KRW ──
+	sellReq := exchange.BestSell(krwAsset, trimFloat(volToSell, 8), e.TimeInForce)
 	sell, err := e.REST.CreateOrder(sellReq)
 	if err != nil {
 		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sell}, err
@@ -316,7 +358,7 @@ func (e *UpbitExecutor) execDirB(
 }
 
 func (e *UpbitExecutor) waitOrderFilled(uuid string, timeout time.Duration) (*exchange.OrderResp, error) {
-	// private WS 사용 시 우선 이벤트 기반으로 대기
+	// private WS 사용 시 우선 이벤트 기반으로 대기 (mu 미보유 상태로 호출)
 	if e.UsePrivateWS {
 		if od, err := e.waitOrderDonePWS(uuid, timeout); err == nil && od != nil {
 			return od, nil
@@ -344,15 +386,17 @@ func (e *UpbitExecutor) waitOrderFilled(uuid string, timeout time.Duration) (*ex
 	return nil, fmt.Errorf("order timeout")
 }
 
-func (e *UpbitExecutor) ensurePrivateWSLocked() {
+func (e *UpbitExecutor) ensurePrivateWS() {
 	if !e.UsePrivateWS {
 		return
 	}
 	e.pwsOnce.Do(func() {
+		e.mu.Lock()
 		e.orderCh = map[string]chan orderEvent{}
 		e.orderLast = map[string]orderEvent{}
 		e.availSig = map[string]chan struct{}{}
 		e.stopCh = make(chan struct{})
+		e.mu.Unlock()
 
 		// 초기 잔고 스냅샷
 		if ac, err := e.REST.GetAccounts(); err == nil {
@@ -373,17 +417,23 @@ func (e *UpbitExecutor) ensurePrivateWSLocked() {
 					return
 				}
 
+				// mu를 잠깐만 보유하여 잔고 업데이트 + 시그널 수집
+				var sigs []chan struct{}
 				e.mu.Lock()
-				defer e.mu.Unlock()
-
 				for _, a := range m.Assets {
-					e.Balances.Set(strings.ToUpper(strings.TrimSpace(a.Currency)), a.Balance)
 					cur := strings.ToUpper(strings.TrimSpace(a.Currency))
+					e.Balances.Set(cur, a.Balance)
 					if ch, ok := e.availSig[cur]; ok {
-						select {
-						case ch <- struct{}{}:
-						default:
-						}
+						sigs = append(sigs, ch)
+					}
+				}
+				e.mu.Unlock()
+
+				// mu 해제 후 시그널 전송 (블로킹 없음)
+				for _, ch := range sigs {
+					select {
+					case ch <- struct{}{}:
+					default:
 					}
 				}
 			},
@@ -412,11 +462,13 @@ func (e *UpbitExecutor) ensurePrivateWSLocked() {
 
 				ev := orderEvent{UUID: m.UUID, Resp: resp, Raw: raw}
 
+				// mu를 잠깐만 보유하여 상태 저장 + 채널 참조 획득
 				e.mu.Lock()
 				e.orderLast[m.UUID] = ev
 				ch := e.orderCh[m.UUID]
 				e.mu.Unlock()
 
+				// mu 해제 후 채널 전송 (waitOrderDonePWS가 대기 중)
 				if ch != nil {
 					select {
 					case ch <- ev:
@@ -427,27 +479,38 @@ func (e *UpbitExecutor) ensurePrivateWSLocked() {
 		}
 
 		go pws.Run()
+
+		e.mu.Lock()
 		e.pwsReady = true
+		e.mu.Unlock()
 	})
 }
 
 func (e *UpbitExecutor) waitOrderDonePWS(uuid string, timeout time.Duration) (*exchange.OrderResp, error) {
-	e.ensurePrivateWSLocked()
+	e.mu.Lock()
 	if !e.pwsReady {
+		e.mu.Unlock()
 		return nil, fmt.Errorf("private ws not ready")
 	}
 
 	ch := make(chan orderEvent, 8)
-
 	e.orderCh[uuid] = ch
+
+	// 이미 완료된 이벤트가 캐시에 있으면 즉시 반환
 	if ev, ok := e.orderLast[uuid]; ok && ev.Resp != nil {
 		if ev.Resp.State == "done" || ev.Resp.State == "cancel" {
 			delete(e.orderCh, uuid)
+			e.mu.Unlock()
 			return ev.Resp, nil
 		}
 	}
+	e.mu.Unlock() // ← 채널 대기 전에 반드시 해제
 
-	defer delete(e.orderCh, uuid)
+	defer func() {
+		e.mu.Lock()
+		delete(e.orderCh, uuid)
+		e.mu.Unlock()
+	}()
 
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
@@ -469,27 +532,32 @@ func (e *UpbitExecutor) waitAvailPositive(currency string, timeout time.Duration
 
 	// private WS 우선
 	if e.UsePrivateWS {
-		e.ensurePrivateWSLocked()
-
+		e.mu.Lock()
 		sig, ok := e.availSig[cur]
 		if !ok {
 			sig = make(chan struct{}, 8)
 			e.availSig[cur] = sig
+		}
+		avail = e.Balances.Get(cur)
+		e.mu.Unlock() // ← 채널 대기 전에 반드시 해제
+
+		if avail > 0 {
+			return avail, 0, nil
 		}
 
 		deadline := time.NewTimer(timeout)
 		defer deadline.Stop()
 
 		for {
-			avail = e.Balances.Get(cur)
-			if avail > 0 {
-				return avail, 0, nil
-			}
-
 			select {
 			case <-deadline.C:
-				break
+				// 타임아웃: 현재 잔고 그대로 반환
+				return e.Balances.Get(cur), 0, fmt.Errorf("avail not positive for %s within %s", cur, timeout)
 			case <-sig:
+				avail = e.Balances.Get(cur)
+				if avail > 0 {
+					return avail, 0, nil
+				}
 			}
 		}
 	}
