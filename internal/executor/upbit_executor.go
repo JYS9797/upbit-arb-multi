@@ -188,6 +188,48 @@ func (e *UpbitExecutor) OnSignal(sig *strategy.Signal) error {
 	return tradeErr
 }
 
+// minUnwindQty: 긴급 청산 주문을 낼 최소 수량 임계값 (너무 소량이면 API 오류 발생)
+const minUnwindQty = 1e-6
+
+// unwindAsset: leg 실패 후 남은 ASSET을 KRW-ASSET 시장에 긴급 매도.
+// 반드시 IOC로 실행 (FoK 설정과 무관하게 부분이라도 팔아야 함).
+func (e *UpbitExecutor) unwindAsset(asset string, qty float64) *exchange.OrderResp {
+	if qty < minUnwindQty {
+		return nil
+	}
+	log.Printf("[unwind] %s %.8f 긴급 청산 시작", asset, qty)
+	req := exchange.BestSell("KRW-"+asset, trimFloat(qty, 8), "ioc")
+	o, err := e.REST.CreateOrder(req)
+	if err != nil {
+		log.Printf("[unwind] %s 주문 실패: %v", asset, err)
+		return nil
+	}
+	final, _ := e.waitOrderFilled(o.UUID, 10*time.Second)
+	if final != nil {
+		log.Printf("[unwind] %s 완료: state=%s vol=%s", asset, final.State, final.ExecutedVolume)
+	}
+	return final
+}
+
+// unwindUSDT: leg 실패 후 남은 USDT를 KRW-USDT 시장에 긴급 매도.
+func (e *UpbitExecutor) unwindUSDT(qty float64) *exchange.OrderResp {
+	if qty < minUnwindQty {
+		return nil
+	}
+	log.Printf("[unwind] USDT %.8f 긴급 청산 시작", qty)
+	req := exchange.BestSell("KRW-USDT", trimFloat(qty, 8), "ioc")
+	o, err := e.REST.CreateOrder(req)
+	if err != nil {
+		log.Printf("[unwind] USDT 주문 실패: %v", err)
+		return nil
+	}
+	final, _ := e.waitOrderFilled(o.UUID, 10*time.Second)
+	if final != nil {
+		log.Printf("[unwind] USDT 완료: state=%s vol=%s", final.State, final.ExecutedVolume)
+	}
+	return final
+}
+
 func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[string]struct {
 	TS    int64
 	Units []marketdata.OrderbookUnit
@@ -203,7 +245,6 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 	}
 	bestAsk := krwBook.Units[0].AskPrice
 
-	// try to buy planned qty but cap by maxKRW at bestAsk
 	qty := sig.Opportunity.BestQtyAsset
 	need := bestAsk * qty
 	if need > maxKRW {
@@ -212,9 +253,7 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 	}
 
 	// ── Leg 1: KRW → ASSET ──
-	krwTotal := fmt.Sprintf("%.0f", need)
-	buyReq := exchange.BestBuy(krwAsset, krwTotal, e.TimeInForce)
-	buy, err := e.REST.CreateOrder(buyReq)
+	buy, err := e.REST.CreateOrder(exchange.BestBuy(krwAsset, fmt.Sprintf("%.0f", need), e.TimeInForce))
 	if err != nil {
 		return []*exchange.OrderResp{buy}, err
 	}
@@ -222,56 +261,68 @@ func (e *UpbitExecutor) execDirA(sig *strategy.Signal, maxKRW float64, snap map[
 	if err != nil {
 		return []*exchange.OrderResp{buyFinal}, err
 	}
-	volAsset, _ := strconv.ParseFloat(buyFinal.ExecutedVolume, 64)
+	volAsset := parseVol(buyFinal.ExecutedVolume)
 	if volAsset <= 0 {
-		return []*exchange.OrderResp{buyFinal}, fmt.Errorf("buy executed_volume=0")
+		// FoK cancel 또는 0 체결 → 자산 없음, 안전하게 종료
+		return []*exchange.OrderResp{buyFinal}, fmt.Errorf("leg1: no fill (state=%s)", buyFinal.State)
 	}
 
 	// Leg 1 완료 후 ASSET 잔고 정산 대기
-	assetAvail, _, waitErr := e.waitAvailPositive(asset, 2*time.Second)
-	if waitErr != nil {
-		log.Printf("[trade] DirA: asset avail wait: %v (fallback to executed_volume)", waitErr)
-		assetAvail = volAsset
-	}
+	assetAvail, _, _ := e.waitAvailPositive(asset, 2*time.Second)
 	volToSell := volAsset
 	if assetAvail > 0 && assetAvail < volToSell {
 		volToSell = assetAvail
 	}
 
 	// ── Leg 2: ASSET → USDT ──
-	sellReq := exchange.BestSell(usdtAsset, trimFloat(volToSell, 8), e.TimeInForce)
-	sell, err := e.REST.CreateOrder(sellReq)
+	sell, err := e.REST.CreateOrder(exchange.BestSell(usdtAsset, trimFloat(volToSell, 8), e.TimeInForce))
 	if err != nil {
-		return []*exchange.OrderResp{buyFinal, sell}, err
+		e.unwindAsset(asset, volToSell)
+		return []*exchange.OrderResp{buyFinal, sell}, fmt.Errorf("leg2 create failed, unwind: %w", err)
 	}
-	sellFinal, err := e.waitOrderFilled(sell.UUID, 6*time.Second)
-	if err != nil {
-		return []*exchange.OrderResp{buyFinal, sellFinal}, err
+	sellFinal, _ := e.waitOrderFilled(sell.UUID, 6*time.Second)
+
+	leg2Sold := parseVol(sellFinal.ExecutedVolume)   // ASSET 판 양
+	usdtReceived := parseVol(sellFinal.ExecutedFunds) // USDT 받은 양
+
+	// 미체결 ASSET 잔량 긴급 청산
+	if remaining := volToSell - leg2Sold; remaining >= minUnwindQty {
+		uw := e.unwindAsset(asset, remaining)
+		if uw != nil {
+			// unwind 주문도 기록에 포함
+			return []*exchange.OrderResp{buyFinal, sellFinal, uw},
+				fmt.Errorf("leg2: partial fill (sold=%.8f remain=%.8f), unwind executed", leg2Sold, remaining)
+		}
 	}
-	usdtFunds, _ := strconv.ParseFloat(sellFinal.ExecutedFunds, 64)
-	if usdtFunds <= 0 {
-		return []*exchange.OrderResp{buyFinal, sellFinal}, fmt.Errorf("sell executed_funds=0")
+	if usdtReceived <= 0 {
+		return []*exchange.OrderResp{buyFinal, sellFinal}, fmt.Errorf("leg2: no USDT received")
 	}
 
 	// Leg 2 완료 후 USDT 잔고 정산 대기
-	usdtAvail, _, waitErr2 := e.waitAvailPositive("USDT", 2*time.Second)
-	if waitErr2 != nil {
-		log.Printf("[trade] DirA: USDT avail wait: %v (fallback to executed_funds)", waitErr2)
-		usdtAvail = usdtFunds
-	}
-	usdtToConv := usdtFunds
+	usdtAvail, _, _ := e.waitAvailPositive("USDT", 2*time.Second)
+	usdtToConv := usdtReceived
 	if usdtAvail > 0 && usdtAvail < usdtToConv {
 		usdtToConv = usdtAvail
 	}
 
 	// ── Leg 3: USDT → KRW ──
-	convReq := exchange.BestSell(krwUsdt, trimFloat(usdtToConv, 8), e.TimeInForce)
-	conv, err := e.REST.CreateOrder(convReq)
+	conv, err := e.REST.CreateOrder(exchange.BestSell(krwUsdt, trimFloat(usdtToConv, 8), e.TimeInForce))
 	if err != nil {
-		return []*exchange.OrderResp{buyFinal, sellFinal, conv}, err
+		e.unwindUSDT(usdtToConv)
+		return []*exchange.OrderResp{buyFinal, sellFinal, conv}, fmt.Errorf("leg3 create failed, unwind: %w", err)
 	}
-	convFinal, err := e.waitOrderFilled(conv.UUID, 6*time.Second)
-	return []*exchange.OrderResp{buyFinal, sellFinal, convFinal}, err
+	convFinal, convErr := e.waitOrderFilled(conv.UUID, 6*time.Second)
+
+	// 미체결 USDT 잔량 긴급 청산
+	leg3SoldUSDT := parseVol(convFinal.ExecutedVolume)
+	if remaining := usdtToConv - leg3SoldUSDT; remaining >= minUnwindQty {
+		uw := e.unwindUSDT(remaining)
+		if uw != nil {
+			return []*exchange.OrderResp{buyFinal, sellFinal, convFinal, uw},
+				fmt.Errorf("leg3: partial fill (sold=%.8f remain=%.8f), unwind executed", leg3SoldUSDT, remaining)
+		}
+	}
+	return []*exchange.OrderResp{buyFinal, sellFinal, convFinal}, convErr
 }
 
 func (e *UpbitExecutor) execDirB(
@@ -289,79 +340,89 @@ func (e *UpbitExecutor) execDirB(
 	krwUsdt := "KRW-USDT"
 
 	// ── Leg 1: KRW → USDT ──
-	krwTotal := fmt.Sprintf("%.0f", maxKRW)
-	buyUsdtReq := exchange.BestBuy(krwUsdt, krwTotal, e.TimeInForce)
-	buyUsdt, err := e.REST.CreateOrder(buyUsdtReq)
+	buyUsdt, err := e.REST.CreateOrder(exchange.BestBuy(krwUsdt, fmt.Sprintf("%.0f", maxKRW), e.TimeInForce))
 	if err != nil {
 		return []*exchange.OrderResp{buyUsdt}, err
 	}
-
 	buyUsdtFinal, err := e.waitOrderFilled(buyUsdt.UUID, 6*time.Second)
 	if err != nil {
 		return []*exchange.OrderResp{buyUsdtFinal}, err
 	}
-
-	usdtGot, _ := strconv.ParseFloat(buyUsdtFinal.ExecutedVolume, 64)
+	usdtGot := parseVol(buyUsdtFinal.ExecutedVolume)
 	if usdtGot <= 0 {
-		return []*exchange.OrderResp{buyUsdtFinal}, fmt.Errorf("buy usdt executed_volume=0")
+		return []*exchange.OrderResp{buyUsdtFinal}, fmt.Errorf("leg1: no USDT received (state=%s)", buyUsdtFinal.State)
 	}
 
 	// Leg 1 완료 후 USDT 잔고 정산 대기
-	usdtAvail, usdtLocked, waitErr := e.waitAvailPositive("USDT", 1500*time.Millisecond)
-	if waitErr != nil {
-		log.Printf("[trade] DirB: waitAvailPositive USDT: %v", waitErr)
-	}
-
-	safety := 0.003 // 0.3%
+	usdtAvail, _, _ := e.waitAvailPositive("USDT", 1500*time.Millisecond)
 	usdtToSpend := usdtAvail
 	if usdtToSpend > usdtGot {
 		usdtToSpend = usdtGot
 	}
-	usdtToSpend = usdtToSpend * (1.0 - safety)
-
+	usdtToSpend *= 0.997 // 0.3% safety margin
 	if usdtToSpend <= 0 {
 		return []*exchange.OrderResp{buyUsdtFinal},
-			fmt.Errorf("no USDT available after step1 (avail=%.8f locked=%.8f got=%.8f)", usdtAvail, usdtLocked, usdtGot)
+			fmt.Errorf("leg1: USDT not available (avail=%.8f got=%.8f)", usdtAvail, usdtGot)
 	}
 
 	// ── Leg 2: USDT → ASSET ──
-	usdtTotal := trimFloat(usdtToSpend, 6)
-	buyAssetReq := exchange.BestBuy(usdtAsset, usdtTotal, e.TimeInForce)
-	buyAsset, err := e.REST.CreateOrder(buyAssetReq)
+	buyAsset, err := e.REST.CreateOrder(exchange.BestBuy(usdtAsset, trimFloat(usdtToSpend, 6), e.TimeInForce))
 	if err != nil {
-		return []*exchange.OrderResp{buyUsdtFinal, buyAsset}, err
+		e.unwindUSDT(usdtToSpend)
+		return []*exchange.OrderResp{buyUsdtFinal, buyAsset}, fmt.Errorf("leg2 create failed, unwind: %w", err)
 	}
+	buyAssetFinal, _ := e.waitOrderFilled(buyAsset.UUID, 6*time.Second)
 
-	buyAssetFinal, err := e.waitOrderFilled(buyAsset.UUID, 6*time.Second)
-	if err != nil {
-		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal}, err
+	usdtSpent := parseVol(buyAssetFinal.ExecutedFunds)  // USDT 사용한 양
+	assetVol := parseVol(buyAssetFinal.ExecutedVolume)  // ASSET 받은 양
+
+	// 미사용 USDT 잔량 긴급 청산
+	if remaining := usdtToSpend - usdtSpent; remaining >= minUnwindQty {
+		uw := e.unwindUSDT(remaining)
+		if assetVol <= 0 {
+			// ASSET을 하나도 못 받은 경우
+			return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, uw},
+				fmt.Errorf("leg2: no asset received, unwind USDT executed")
+		}
+		if uw != nil {
+			log.Printf("[trade] DirB leg2: USDT %.8f unwind 완료", remaining)
+		}
 	}
-
-	assetVol, _ := strconv.ParseFloat(buyAssetFinal.ExecutedVolume, 64)
 	if assetVol <= 0 {
-		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal}, fmt.Errorf("buy asset executed_volume=0")
+		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal}, fmt.Errorf("leg2: no asset received")
 	}
 
 	// Leg 2 완료 후 ASSET 잔고 정산 대기
-	assetAvail, _, waitErr2 := e.waitAvailPositive(asset, 2*time.Second)
-	if waitErr2 != nil {
-		log.Printf("[trade] DirB: asset avail wait: %v (fallback to executed_volume)", waitErr2)
-		assetAvail = assetVol
-	}
+	assetAvail, _, _ := e.waitAvailPositive(asset, 2*time.Second)
 	volToSell := assetVol
 	if assetAvail > 0 && assetAvail < volToSell {
 		volToSell = assetAvail
 	}
 
 	// ── Leg 3: ASSET → KRW ──
-	sellReq := exchange.BestSell(krwAsset, trimFloat(volToSell, 8), e.TimeInForce)
-	sell, err := e.REST.CreateOrder(sellReq)
+	sell, err := e.REST.CreateOrder(exchange.BestSell(krwAsset, trimFloat(volToSell, 8), e.TimeInForce))
 	if err != nil {
-		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sell}, err
+		e.unwindAsset(asset, volToSell)
+		return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sell}, fmt.Errorf("leg3 create failed, unwind: %w", err)
 	}
+	sellFinal, sellErr := e.waitOrderFilled(sell.UUID, 6*time.Second)
 
-	sellFinal, err := e.waitOrderFilled(sell.UUID, 6*time.Second)
-	return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sellFinal}, err
+	// 미체결 ASSET 잔량 긴급 청산
+	leg3Sold := parseVol(sellFinal.ExecutedVolume)
+	if remaining := volToSell - leg3Sold; remaining >= minUnwindQty {
+		uw := e.unwindAsset(asset, remaining)
+		if uw != nil {
+			return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sellFinal, uw},
+				fmt.Errorf("leg3: partial fill (sold=%.8f remain=%.8f), unwind executed", leg3Sold, remaining)
+		}
+	}
+	return []*exchange.OrderResp{buyUsdtFinal, buyAssetFinal, sellFinal}, sellErr
+}
+
+// parseVol: 주문 응답의 string 필드를 float64로 변환 (파싱 실패 시 0)
+func parseVol(s string) float64 {
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
 
 func (e *UpbitExecutor) waitOrderFilled(uuid string, timeout time.Duration) (*exchange.OrderResp, error) {
